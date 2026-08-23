@@ -31,7 +31,7 @@
  */
 
 import { WebSocketServer } from 'ws';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer, get as httpGet } from 'node:http';
 import { createConnection, createServer as createTcpServer, connect as tcpConnect } from 'node:net';
 
@@ -124,6 +124,44 @@ const MAX_PAYLOAD_BYTES = envInt('BRIDGE_MAX_PAYLOAD_MB', 100) * 1024 * 1024;
  * so it is enabled by default there and off for a non-loopback host.
  */
 const IPV6_LOOPBACK = envBool('BRIDGE_IPV6_LOOPBACK', isLoopbackHost(LISTEN_HOST));
+
+// ─── Authentication ─────────────────────────────────────────────────
+// Unset BRIDGE_AUTH_TOKEN = no authentication, exactly as before. Set it to
+// require a shared secret on every HTTP route (except GET /health) and on
+// every WebSocket connection. Mandatory whenever the bridge is reachable from
+// anywhere but the local machine — it executes arbitrary JavaScript inside the
+// user's EDA client.
+const AUTH_TOKEN = process.env.BRIDGE_AUTH_TOKEN?.trim() || null;
+const AUTH_REQUIRED = AUTH_TOKEN !== null;
+
+/**
+ * Compare a candidate secret against the configured token without leaking
+ * timing information about how many characters matched.
+ * @param {string|null|undefined} candidate
+ * @returns {boolean}
+ */
+function tokenIsValid(candidate) {
+  if (!AUTH_REQUIRED) return true;
+  if (typeof candidate !== 'string' || candidate.length === 0) return false;
+  const a = Buffer.from(candidate, 'utf8');
+  const b = Buffer.from(AUTH_TOKEN, 'utf8');
+  // timingSafeEqual throws on differing lengths; a length mismatch is already
+  // observable from the request itself, so short-circuit before comparing.
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * Extract the credential from an `Authorization: Bearer <token>` header.
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {string|null}
+ */
+function bearerToken(req) {
+  const header = req.headers['authorization'];
+  if (typeof header !== 'string') return null;
+  const match = /^Bearer[ \t]+(.+)$/i.exec(header.trim());
+  return match ? match[1].trim() : null;
+}
 
 function formatBannerLine(label, value) {
   return `║  ${`${label}:`.padEnd(12)} ${String(value).padEnd(44)}║`;
@@ -230,7 +268,7 @@ const httpServer = createServer(async (req, res) => {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -248,8 +286,22 @@ const httpServer = createServer(async (req, res) => {
       edaWindowCount: edaClients.size,
       activeWindowId: activeEdaWindowId,
       pendingRequests: pendingRequests.size,
+      // Advertise the requirement so clients know to present a token.
+      // Never expose the token itself.
+      authRequired: AUTH_REQUIRED,
       timestamp: Date.now(),
     }));
+    return;
+  }
+
+  // Every other route requires the bearer token when authentication is on.
+  if (AUTH_REQUIRED && !tokenIsValid(bearerToken(req))) {
+    console.warn(`[HTTP] 401 ${req.method} ${req.url} from ${req.socket.remoteAddress}`);
+    res.writeHead(401, {
+      'Content-Type': 'application/json',
+      'WWW-Authenticate': 'Bearer realm="easyeda-bridge"',
+    });
+    res.end(JSON.stringify({ error: 'Unauthorized: missing or invalid bearer token' }));
     return;
   }
 
@@ -326,7 +378,20 @@ const httpServer = createServer(async (req, res) => {
 });
 
 // ─── WebSocket Server ───────────────────────────────────────────────
-const wss = new WebSocketServer({ server: httpServer, maxPayload: MAX_PAYLOAD_BYTES });
+// Agent sockets authenticate with an `Authorization: Bearer <token>` header on
+// the upgrade request, which is rejected before the connection is established.
+// EDA client sockets cannot set headers (the extension uses the browser
+// WebSocket API), so they authenticate in-band via the `register` message.
+const wss = new WebSocketServer({
+  server: httpServer,
+  maxPayload: MAX_PAYLOAD_BYTES,
+  verifyClient: ({ req }, done) => {
+    if (!AUTH_REQUIRED || req.url === '/eda') return done(true);
+    if (tokenIsValid(bearerToken(req))) return done(true);
+    console.warn(`[WS] Rejected unauthenticated agent connection from ${req.socket.remoteAddress}`);
+    done(false, 401, 'Unauthorized');
+  },
+});
 
 wss.on('connection', (ws, req) => {
   const clientType = req.url === '/eda' ? 'eda' : 'agent';
@@ -337,6 +402,8 @@ wss.on('connection', (ws, req) => {
     type: 'handshake',
     service: SERVICE_ID,
     clientType,
+    // Tells the EDA client whether its `register` message must carry a token.
+    authRequired: AUTH_REQUIRED,
     timestamp: Date.now(),
   }));
 
@@ -348,6 +415,12 @@ wss.on('connection', (ws, req) => {
         const msg = JSON.parse(raw.toString());
         if (msg.type === 'register' && msg.windowId) {
           // EDA client registering with window ID
+          if (AUTH_REQUIRED && !tokenIsValid(msg.token)) {
+            console.warn(`[WS] EDA registration rejected (auth) from ${req.socket.remoteAddress}`);
+            ws.send(JSON.stringify({ type: 'error', error: 'auth-failed', timestamp: Date.now() }));
+            ws.close(1008, 'auth-failed');
+            return;
+          }
           registeredWindowId = msg.windowId;
           edaClients.set(registeredWindowId, ws);
           // Auto-select if first window or if no active window
@@ -355,6 +428,13 @@ wss.on('connection', (ws, req) => {
             activeEdaWindowId = registeredWindowId;
           }
           console.log(`[WS] EDA window registered: ${registeredWindowId}, total: ${edaClients.size}`);
+          ws.send(JSON.stringify({ type: 'registered', windowId: registeredWindowId, timestamp: Date.now() }));
+          return;
+        }
+        // With authentication on, nothing is accepted before a valid register.
+        if (AUTH_REQUIRED && !registeredWindowId) {
+          ws.send(JSON.stringify({ type: 'error', error: 'auth-failed', timestamp: Date.now() }));
+          ws.close(1008, 'auth-failed');
           return;
         }
         // Always pass a valid windowId (use registeredWindowId if available, otherwise log warning)
@@ -589,6 +669,7 @@ ${formatBannerLine('Listen Host', `${LISTEN_HOST}${isLoopbackHost(LISTEN_HOST) ?
 ${formatBannerLine('Port Range', FIXED_PORT !== null ? 'n/a (fixed port)' : `${PORT_START}-${PORT_END}`)}
 ${formatBannerLine('Timeout', `${REQUEST_TIMEOUT_MS} ms`)}
 ${formatBannerLine('Max Payload', `${MAX_PAYLOAD_BYTES / 1024 / 1024} MB`)}
+${formatBannerLine('Auth', AUTH_REQUIRED ? 'bearer token required' : 'disabled (no token set)')}
 ${formatBannerLine('Service ID', SERVICE_ID)}
 ║                                                              ║
 ║  HTTP API:    http://localhost:${port}                         ║
@@ -606,6 +687,14 @@ ${formatBannerLine('Service ID', SERVICE_ID)}
 ╚══════════════════════════════════════════════════════════════╝
       `);
     });
+
+    if (!isLoopbackHost(LISTEN_HOST) && !AUTH_REQUIRED) {
+      console.warn(
+        `⚠️  Listening on ${LISTEN_HOST} without authentication. Anyone who can reach this\n` +
+        `    port can execute arbitrary JavaScript in the EDA client. Set BRIDGE_AUTH_TOKEN\n` +
+        `    and terminate TLS in front of the bridge, or bind to 127.0.0.1 and use a proxy.`,
+      );
+    }
 
     startIpv6LoopbackForwarder(port);
 

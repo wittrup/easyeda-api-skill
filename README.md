@@ -72,6 +72,7 @@ is optional**, and the defaults reproduce the server's original behaviour, so
 | `BRIDGE_TIMEOUT_MS` | `30000` | How long to wait for the EDA client to answer an `execute` request. Raise it for long-running operations — generating a 3D/STEP model or a full manufacturing export of a large board can take several minutes and will otherwise fail with a timeout. |
 | `BRIDGE_MAX_PAYLOAD_MB` | `100` | Maximum WebSocket frame size (100 MB is the `ws` library default). Raise it when a single result is large — a base64-encoded 3D model or gerber archive can exceed 100 MB, and the socket then dies with `Max payload size exceeded`. |
 | `BRIDGE_IPV6_LOOPBACK` | on for a loopback `BRIDGE_HOST`, off otherwise | Also listen on `[::1]` and forward to the main listener. **Symptom this fixes:** on Windows the EasyEDA client (Electron) resolves `localhost` to `::1` first; a server bound only to `127.0.0.1` is invisible to it and the extension reports *"Bridge not found"* even though `curl http://127.0.0.1:<port>/health` works. Set to `0` to disable, `1` to force it on. |
+| `BRIDGE_AUTH_TOKEN` | *(unset — no authentication)* | Shared secret required on every HTTP route except `GET /health`, and on every WebSocket connection. Leave unset for the usual local setup; **set it whenever the bridge is reachable from anything but the local machine.** See [Security](#security). |
 
 Booleans accept `1/0`, `true/false`, `yes/no`, `on/off`.
 
@@ -80,6 +81,74 @@ Example — a long-running export session on a pinned port:
 ```bash
 BRIDGE_PORT=49620 BRIDGE_TIMEOUT_MS=600000 BRIDGE_MAX_PAYLOAD_MB=1024 npm run server
 ```
+
+### Authentication
+
+Setting `BRIDGE_AUTH_TOKEN` turns on bearer-token authentication. With the
+variable unset nothing changes — no credential is checked anywhere.
+
+When it is set:
+
+- **HTTP routes** require `Authorization: Bearer <token>` and answer `401`
+  otherwise.
+- **`GET /health` stays open** so port discovery and health probes keep working
+  without a credential. Its JSON gains `"authRequired": true`; the token itself
+  is never exposed.
+- **Agent WebSocket connections** (`ws://…/agent`) send the same
+  `Authorization: Bearer <token>` header on the upgrade request. An
+  unauthenticated upgrade is rejected with `401` before the socket opens.
+- **EDA client WebSocket connections** (`ws://…/eda`) authenticate in-band,
+  because the extension uses the browser WebSocket API and cannot set request
+  headers. The `register` message carries the token:
+
+  ```json
+  { "type": "register", "windowId": "…", "token": "…", "timestamp": 1700000000000 }
+  ```
+
+  On success the server replies `{ "type": "registered", "windowId": "…" }`. On
+  a missing or wrong token it replies `{ "type": "error", "error": "auth-failed" }`
+  and closes the socket; the client is never registered. The server's
+  `handshake` message includes `"authRequired": true` so a client knows a token
+  is expected before it registers.
+
+Tokens are compared in constant time. Generate one with
+`node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
+
+```bash
+# server
+BRIDGE_AUTH_TOKEN=$MY_TOKEN npm run server
+
+# client
+curl -H "Authorization: Bearer $MY_TOKEN" \
+     -X POST http://127.0.0.1:49620/execute \
+     -H "Content-Type: application/json" \
+     -d '{"code": "return await eda.dmt_Project.getCurrentProjectInfo();"}'
+```
+
+## Security
+
+**The bridge executes arbitrary JavaScript inside the user's EDA client.**
+Anyone who can open a connection to it can read, modify, and export the user's
+projects. Treat reachability of the bridge port as equivalent to control of the
+EDA client.
+
+- The default bind is `127.0.0.1`. Keep it there whenever you can.
+- If the bridge must be reachable from another machine, a token **and**
+  transport encryption are both mandatory: `BRIDGE_AUTH_TOKEN` alone sends the
+  secret in cleartext over plain HTTP/WS, where it can be captured and replayed.
+- The recommended layout is to leave the bridge on loopback and put a reverse
+  proxy (nginx, Caddy, Traefik, …) in front of it that terminates TLS and
+  forwards to `127.0.0.1:<port>`, so clients connect over `https://` and
+  `wss://`. Prefer this over setting `BRIDGE_HOST=0.0.0.0`, which exposes the
+  raw, unencrypted port on every interface.
+- Better still, put the remote hop on a private overlay network or an SSH
+  tunnel and let the bridge see only loopback traffic.
+- Keep the token out of shell history, source control and URLs — pass it
+  through the environment or a secrets file, and send it in the `Authorization`
+  header, never as a query parameter.
+
+The server prints a warning at startup if it binds a non-loopback address with
+authentication disabled.
 
 ## One-Command Packaging
 

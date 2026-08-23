@@ -112,6 +112,17 @@ All of these are optional; unset means the default behaviour described above.
 | `BRIDGE_TIMEOUT_MS` | `30000` | Raise for slow operations (3D/STEP export, full manufacturing output of a large board). |
 | `BRIDGE_MAX_PAYLOAD_MB` | `100` | Raise when a single result is huge (base64 3D model / gerber archive) and the socket dies with `Max payload size exceeded`. |
 | `BRIDGE_IPV6_LOOPBACK` | on for loopback host | Also answer on `[::1]`. Fixes the Windows "Bridge not found" symptom: Electron resolves `localhost` to `::1` first, so an IPv4-only listener is invisible to the EDA client. |
+| `BRIDGE_AUTH_TOKEN` | *(unset — no auth)* | Require `Authorization: Bearer <token>` on every route except `GET /health`. Mandatory if the bridge is not loopback-only. |
+
+**If the bridge requires a token**, `GET /health` reports `"authRequired": true`
+and every other request needs the header:
+
+```bash
+curl -H "Authorization: Bearer $BRIDGE_AUTH_TOKEN" http://localhost:${BRIDGE_PORT}/eda-windows
+```
+
+Without it the server answers `401`. Never put the token in a URL, and never
+echo it back to the user.
 
 ```bash
 BRIDGE_TIMEOUT_MS=600000 BRIDGE_MAX_PAYLOAD_MB=1024 node ${CLAUDE_SKILL_DIR}/scripts/bridge-server.mjs &
@@ -299,6 +310,13 @@ done
 - **HTTP**: `GET /health` returns `{ "service": "easyeda-bridge", "edaConnected": bool, ... }`
 - **WebSocket**: On connect, server sends `{ "type": "handshake", "service": "easyeda-bridge" }`
 - Clients MUST verify `service === "easyeda-bridge"` before using the connection
+- Both messages carry `authRequired`. When it is `true`:
+  - HTTP requests (except `GET /health`) need `Authorization: Bearer <token>`
+  - agent WebSockets send the same header on the upgrade request
+  - the EDA client puts the token in its `register` message
+    (`{ "type": "register", "windowId": "...", "token": "..." }`) and gets back
+    `{ "type": "registered", "windowId": "..." }`, or
+    `{ "type": "error", "error": "auth-failed" }` followed by a close
 
 ### Message Format
 
