@@ -139,6 +139,15 @@ const pendingRequests = new Map();
 /** @type {string | null} 当前AI端选中的EDA窗口ID */
 let activeEdaWindowId = null;
 
+/** @type {Set<import('ws').WebSocket>} Connected agent/AI WebSocket clients */
+const agentClients = new Set();
+
+/** @type {Set<import('node:http').ServerResponse>} Open GET /events SSE streams */
+const eventSubscribers = new Set();
+
+/** Interval between SSE keep-alive comments, to hold idle proxies open. */
+const SSE_KEEPALIVE_MS = 25_000;
+
 // ─── Port Detection ─────────────────────────────────────────────────
 
 /**
@@ -321,6 +330,34 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
+  // Subscribe to EDA change events (Server-Sent Events)
+  if (req.method === 'GET' && req.url === '/events') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+      // Tell nginx and friends not to buffer this response.
+      'X-Accel-Buffering': 'no',
+    });
+    res.socket?.setNoDelay(true);
+    res.socket?.setTimeout(0);
+    res.write(`: connected to ${SERVICE_ID}\n\n`);
+
+    const keepAlive = setInterval(() => res.write(': keep-alive\n\n'), SSE_KEEPALIVE_MS);
+    eventSubscribers.add(res);
+    console.log(`[SSE] Subscriber connected, total: ${eventSubscribers.size}`);
+
+    const cleanup = () => {
+      clearInterval(keepAlive);
+      if (eventSubscribers.delete(res)) {
+        console.log(`[SSE] Subscriber disconnected, total: ${eventSubscribers.size}`);
+      }
+    };
+    req.on('close', cleanup);
+    res.on('error', cleanup);
+    return;
+  }
+
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found' }));
 });
@@ -389,6 +426,8 @@ wss.on('connection', (ws, req) => {
     });
   } else {
     // Agent / AI client connection
+    agentClients.add(ws);
+
     ws.on('message', async (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
@@ -418,6 +457,7 @@ wss.on('connection', (ws, req) => {
     });
 
     ws.on('close', () => {
+      agentClients.delete(ws);
       console.log('[WS] Agent client disconnected');
     });
   }
@@ -490,6 +530,35 @@ function executeOnEda(code, windowId) {
 }
 
 /**
+ * Fan an EDA-originated event out to every agent WebSocket and every open
+ * /events stream. Delivery is live-only and best effort: there is no buffer and
+ * no replay, so a subscriber that connects later does not see earlier events.
+ * @param {object} event Fully formed event message
+ */
+function broadcastEvent(event) {
+  const payload = JSON.stringify(event);
+
+  for (const client of agentClients) {
+    if (client.readyState !== 1) continue;
+    try {
+      client.send(payload);
+    } catch (err) {
+      console.error('[Event] Failed to send to agent client:', err.message);
+    }
+  }
+
+  for (const res of eventSubscribers) {
+    try {
+      // Named SSE event, so browser clients can addEventListener by name.
+      res.write(`event: ${event.event}\ndata: ${payload}\n\n`);
+    } catch (err) {
+      console.error('[Event] Failed to write to SSE subscriber:', err.message);
+      eventSubscribers.delete(res);
+    }
+  }
+}
+
+/**
  * Handle messages received from EDA client
  * @param {object} msg - Message from EDA
  * @param {string} windowId - EDA window ID that sent the message
@@ -516,6 +585,19 @@ function handleEdaMessage(msg, windowId) {
 
   if (msg.type === 'pong') {
     console.log('[EDA] Pong received from window', windowId, '- connection healthy');
+    return;
+  }
+
+  // Unsolicited notification from the EDA client (document saved, selection
+  // changed, ...). Forwarded as-is to anyone listening. Inert until an
+  // extension actually emits these.
+  if (msg.type === 'event') {
+    if (typeof msg.event !== 'string' || msg.event === '') {
+      console.warn(`[Event] Ignoring event without a name from window ${windowId}`);
+      return;
+    }
+    const { type: _type, ...payload } = msg;
+    broadcastEvent({ type: 'event', ...payload, windowId, timestamp: msg.timestamp ?? Date.now() });
     return;
   }
 
@@ -598,6 +680,7 @@ ${formatBannerLine('Service ID', SERVICE_ID)}
 ║  Endpoints:                                                  ║
 ║    GET  /health     - 健康检查 & EDA 连接状态                ║
 ║    POST /execute    - 执行代码 {"code": "..."}               ║
+║    GET  /events     - EDA change event stream (SSE)          ║
 ║                                                              ║
 ║  Handshake:                                                  ║
 ║    /health returns { service: "${SERVICE_ID}" }       ║
