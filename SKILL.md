@@ -335,7 +335,27 @@ JSON messages over WebSocket / HTTP:
 | `result` | `any` | Execution result (for `result` type) |
 | `error` | `string` | Error message (for `error` type) |
 | `service` | `string` | Service identifier (for `handshake` type) |
+| `event` | `string` | Event name (for `event` type — unsolicited EDA → AI notification) |
 | `timestamp` | `number` | Unix milliseconds |
+
+### Change Events (optional)
+
+If the installed EDA extension emits them, unsolicited `{"type":"event",
+"event":"<name>", …}` messages are relayed to every agent WebSocket and to the
+`GET /events` Server-Sent Events stream.
+
+First check that the bridge supports it — `GET /health` reports
+`"capabilities": ["events"]`. Check that list instead of probing `/events`; a
+bridge without the feature omits `"events"` (older ones omit `capabilities`
+entirely, which means the same thing).
+
+```bash
+curl -N http://localhost:${BRIDGE_PORT:-49620}/events
+```
+
+Live-only, no replay. An extension that emits no events leaves the stream quiet,
+so do not wait on it as a way to detect that something happened — poll the
+relevant API instead unless you know events are supported.
 
 ## Common Patterns
 

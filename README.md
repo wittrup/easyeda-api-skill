@@ -76,6 +76,66 @@ mutating APIs in read mode. Sending `"read"` is therefore a request, not a
 guarantee, and an older extension that does not know the field will simply
 ignore it. Any value other than `read` or `write` is rejected with `400`.
 
+## Change Events
+
+The bridge can relay unsolicited notifications from the EDA client — a document
+saved, a selection changed, a DRC run finished — to anything watching, so a
+daemon does not have to poll the client for state.
+
+An EDA client sends:
+
+```json
+{ "type": "event", "event": "document-saved", "docId": "…", "timestamp": 1700000000000 }
+```
+
+The bridge stamps the originating `windowId` on it and fans it out unchanged to
+every connected agent WebSocket and every open `/events` stream. It does not
+interpret the event name or payload, so new event types need no server change.
+
+**Detecting support** — `GET /health` lists the optional features the running
+bridge provides:
+
+```json
+{ "service": "easyeda-bridge", "status": "ok", "capabilities": ["events"], "…": "…" }
+```
+
+Check for `"events"` in `capabilities` rather than probing `/events` and reading
+a `404`, which cannot distinguish an older bridge from a transient error. The
+field is always present, whatever the authentication settings, and older bridges
+simply omit it — treat a missing `capabilities` as an empty list.
+
+**Subscribing over HTTP** — `GET /events` is a
+[Server-Sent Events](https://developer.mozilla.org/docs/Web/API/Server-sent_events)
+stream:
+
+```bash
+curl -N http://localhost:49620/events
+```
+
+```text
+event: document-saved
+data: {"type":"event","event":"document-saved","docId":"…","windowId":"abc-123","timestamp":1700000000000}
+```
+
+SSE rather than long-polling: it is one connection that stays open, so there is
+no gap between polls in which an event can be missed and no cursor bookkeeping
+on either side; it is plain HTTP on the port that already exists, so it passes
+through the same reverse proxy as everything else; browsers reconnect
+automatically via `EventSource`; and `curl -N` is enough for a shell-based
+agent. Long-polling would have required a per-subscriber queue in the bridge to
+cover the interval between requests.
+
+Notes:
+
+- Delivery is **live-only and best effort** — there is no buffer and no replay,
+  so a subscriber sees only events that arrive while it is connected.
+- A keep-alive comment is sent every 25s to stop idle proxies closing the
+  stream, and the response carries `X-Accel-Buffering: no`. Reverse proxies must
+  not buffer this route (`proxy_buffering off;` in nginx).
+- **This depends on EDA-side support.** The bridge is ready for `event`
+  messages, but they only appear if the installed extension emits them; with an
+  extension that does not, `/events` simply stays quiet.
+
 ## Bridge Server Configuration
 
 The bridge server is configured through environment variables. **Every variable
