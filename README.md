@@ -59,6 +59,23 @@ curl -X POST http://localhost:49620/execute \
   -d '{"code": "return await eda.dmt_Project.getCurrentProjectInfo();"}'
 ```
 
+### Execution Mode
+
+`POST /execute` accepts an optional `mode` field, `"read"` or `"write"`
+(default `"write"`, i.e. the previous behaviour):
+
+```bash
+curl -X POST http://localhost:49620/execute \
+  -H "Content-Type: application/json" \
+  -d '{"mode": "read", "code": "return await eda.dmt_Project.getCurrentProjectInfo();"}'
+```
+
+The bridge only forwards the value verbatim in the `execute` message it sends
+to the EDA client — **enforcement happens in the EDA extension**, which refuses
+mutating APIs in read mode. Sending `"read"` is therefore a request, not a
+guarantee, and an older extension that does not know the field will simply
+ignore it. Any value other than `read` or `write` is rejected with `400`.
+
 ## Bridge Server Configuration
 
 The bridge server is configured through environment variables. **Every variable

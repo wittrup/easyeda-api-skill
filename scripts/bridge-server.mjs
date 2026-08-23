@@ -356,13 +356,19 @@ const httpServer = createServer(async (req, res) => {
       const payload = JSON.parse(body);
       const code = payload.code;
       const windowId = payload.windowId; // optional, uses active window if not specified
+      const mode = payload.mode ?? 'write'; // optional, "read" | "write"
       if (!code || typeof code !== 'string') {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Missing "code" field (string)' }));
         return;
       }
+      if (mode !== 'read' && mode !== 'write') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: '"mode" must be "read" or "write"' }));
+        return;
+      }
 
-      const result = await executeOnEda(code, windowId);
+      const result = await executeOnEda(code, windowId, mode);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, result, windowId: windowId || activeEdaWindowId }));
     } catch (err) {
@@ -474,7 +480,7 @@ wss.on('connection', (ws, req) => {
         const msg = JSON.parse(raw.toString());
         if (msg.type === 'execute') {
           try {
-            const result = await executeOnEda(msg.code, msg.windowId);
+            const result = await executeOnEda(msg.code, msg.windowId, msg.mode === 'read' ? 'read' : 'write');
             ws.send(JSON.stringify({
               type: 'result',
               id: msg.id,
@@ -529,9 +535,11 @@ function sendToEda(windowId, msg) {
  * Execute JavaScript code on the EDA client and return the result
  * @param {string} code - JavaScript code to execute in EDA context
  * @param {string} [windowId] - Specific EDA window ID (uses active window if not specified)
+ * @param {'read'|'write'} [mode] - Requested access level, forwarded to the EDA
+ *   client, which is what actually enforces read-only. The bridge only relays it.
  * @returns {Promise<any>}
  */
-function executeOnEda(code, windowId) {
+function executeOnEda(code, windowId, mode = 'write') {
   return new Promise((resolve, reject) => {
     const targetWindowId = windowId || activeEdaWindowId;
 
@@ -558,6 +566,7 @@ function executeOnEda(code, windowId) {
         type: 'execute',
         id,
         code,
+        mode,
         windowId: targetWindowId,
         timestamp: Date.now(),
       });
