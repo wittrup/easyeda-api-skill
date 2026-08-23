@@ -284,7 +284,7 @@ async function findAvailablePort() {
 const httpServer = createServer(async (req, res) => {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, HEAD, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') {
@@ -293,10 +293,12 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
-  // Health check — includes service identifier for client handshake verification
-  if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
+  // Health check — includes service identifier for client handshake verification.
+  // HEAD is answered alongside GET: monitors and proxies use it for liveness,
+  // and letting it fall through to the auth gate below would answer an
+  // unauthenticated 401 on a route that is deliberately open.
+  if ((req.method === 'GET' || req.method === 'HEAD') && req.url === '/health') {
+    const body = JSON.stringify({
       service: SERVICE_ID,
       status: 'ok',
       edaConnected: edaClients.size > 0,
@@ -308,7 +310,13 @@ const httpServer = createServer(async (req, res) => {
       authRequired: AUTH_REQUIRED,
       capabilities: CAPABILITIES,
       timestamp: Date.now(),
-    }));
+    });
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+    });
+    // A HEAD response carries the headers but no body.
+    res.end(req.method === 'HEAD' ? undefined : body);
     return;
   }
 
