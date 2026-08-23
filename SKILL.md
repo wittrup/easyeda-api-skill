@@ -187,6 +187,10 @@ curl -X POST http://localhost:${BRIDGE_PORT:-49620}/execute \
   -d '{"code": "return await eda.dmt_Project.getCurrentProjectInfo();"}'
 ```
 
+Add `"mode": "read"` to the body for inspection-only code. The EDA extension
+enforces it by refusing mutating APIs; the bridge just forwards the field.
+Omitting it means `"write"`.
+
 ## API Documentation
 
 The full API reference is in the [references/](references/) directory:
@@ -327,6 +331,7 @@ JSON messages over WebSocket / HTTP:
 | `type` | `"execute"` \| `"result"` \| `"error"` \| `"ping"` \| `"pong"` \| `"handshake"` | Message type |
 | `id` | `string` | Request UUID for matching request/response |
 | `code` | `string` | JavaScript code to execute (for `execute` type) |
+| `mode` | `"read"` \| `"write"` | Optional, default `"write"`. Forwarded to the EDA client, which enforces read-only; the bridge only relays it |
 | `result` | `any` | Execution result (for `result` type) |
 | `error` | `string` | Error message (for `error` type) |
 | `service` | `string` | Service identifier (for `handshake` type) |
