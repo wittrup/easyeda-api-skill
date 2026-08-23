@@ -75,6 +75,18 @@ The bridge stamps the originating `windowId` on it and fans it out unchanged to
 every connected agent WebSocket and every open `/events` stream. It does not
 interpret the event name or payload, so new event types need no server change.
 
+**Detecting support** — `GET /health` lists the optional features the running
+bridge provides:
+
+```json
+{ "service": "easyeda-bridge", "status": "ok", "capabilities": ["events"], "…": "…" }
+```
+
+Check for `"events"` in `capabilities` rather than probing `/events` and reading
+a `404`, which cannot distinguish an older bridge from a transient error. The
+field is always present, whatever the authentication settings, and older bridges
+simply omit it — treat a missing `capabilities` as an empty list.
+
 **Subscribing over HTTP** — `GET /events` is a
 [Server-Sent Events](https://developer.mozilla.org/docs/Web/API/Server-sent_events)
 stream:

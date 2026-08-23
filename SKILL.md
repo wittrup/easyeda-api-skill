@@ -319,7 +319,12 @@ JSON messages over WebSocket / HTTP:
 
 If the installed EDA extension emits them, unsolicited `{"type":"event",
 "event":"<name>", …}` messages are relayed to every agent WebSocket and to the
-`GET /events` Server-Sent Events stream:
+`GET /events` Server-Sent Events stream.
+
+First check that the bridge supports it — `GET /health` reports
+`"capabilities": ["events"]`. Check that list instead of probing `/events`; a
+bridge without the feature omits `"events"` (older ones omit `capabilities`
+entirely, which means the same thing).
 
 ```bash
 curl -N http://localhost:${BRIDGE_PORT:-49620}/events

@@ -148,6 +148,14 @@ const eventSubscribers = new Set();
 /** Interval between SSE keep-alive comments, to hold idle proxies open. */
 const SSE_KEEPALIVE_MS = 25_000;
 
+/**
+ * Optional features this build supports, advertised by GET /health so clients
+ * can negotiate instead of probing endpoints and interpreting a 404.
+ * Not sensitive: always reported, whatever the authentication settings.
+ * @type {string[]}
+ */
+const CAPABILITIES = ['events'];
+
 // ─── Port Detection ─────────────────────────────────────────────────
 
 /**
@@ -257,6 +265,7 @@ const httpServer = createServer(async (req, res) => {
       edaWindowCount: edaClients.size,
       activeWindowId: activeEdaWindowId,
       pendingRequests: pendingRequests.size,
+      capabilities: CAPABILITIES,
       timestamp: Date.now(),
     }));
     return;
