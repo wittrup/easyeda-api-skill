@@ -113,6 +113,7 @@ All of these are optional; unset means the default behaviour described above.
 | `BRIDGE_MAX_PAYLOAD_MB` | `100` | Raise when a single result is huge (base64 3D model / gerber archive) and the socket dies with `Max payload size exceeded`. |
 | `BRIDGE_IPV6_LOOPBACK` | on for loopback host | Also answer on `[::1]`. Fixes the Windows "Bridge not found" symptom: Electron resolves `localhost` to `::1` first, so an IPv4-only listener is invisible to the EDA client. |
 | `BRIDGE_AUTH_TOKEN` | *(unset — no auth)* | Require `Authorization: Bearer <token>` on every route except `GET /health`. Mandatory if the bridge is not loopback-only. |
+| `BRIDGE_TAILSCALE_WHOIS` | `off` | Also check *who* is connecting via `tailscale whois`, allowing only `BRIDGE_ALLOWED_USERS` (e.g. `user@example.com`) or `BRIDGE_ALLOWED_TAGS` (e.g. `tag:ci`). Fails closed; loopback peers exempt. Remote peers otherwise get `403`. |
 
 **If the bridge requires a token**, `GET /health` reports `"authRequired": true`
 and every other request needs the header:

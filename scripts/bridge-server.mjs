@@ -33,7 +33,8 @@
 import { WebSocketServer } from 'ws';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer, get as httpGet } from 'node:http';
-import { createConnection, createServer as createTcpServer, connect as tcpConnect } from 'node:net';
+import { createConnection, createServer as createTcpServer, connect as tcpConnect, isIP } from 'node:net';
+import { execFile } from 'node:child_process';
 
 // ─── Port Configuration ─────────────────────────────────────────────
 const PORT_START = 49620;
@@ -161,6 +162,128 @@ function bearerToken(req) {
   if (typeof header !== 'string') return null;
   const match = /^Bearer[ \t]+(.+)$/i.exec(header.trim());
   return match ? match[1].trim() : null;
+}
+
+// ─── Tailscale identity allowlist (optional) ────────────────────────
+// Off by default. When enabled, the peer IP of every incoming connection is
+// resolved with `tailscale whois` and only allowlisted identities are served.
+// This is a second, identity-based layer on top of BRIDGE_AUTH_TOKEN — it does
+// not replace it, since a shared token cannot tell you *who* is connecting.
+
+const TAILSCALE_WHOIS = envBool('BRIDGE_TAILSCALE_WHOIS', false);
+
+/** Tailscale CLI to invoke. Looked up on PATH unless an absolute path is given. */
+const TAILSCALE_BIN = process.env.BRIDGE_TAILSCALE_BIN?.trim() || 'tailscale';
+
+/**
+ * Parse a comma-separated environment list into a lowercase Set.
+ * @param {string} name
+ * @returns {Set<string>}
+ */
+function envList(name) {
+  return new Set(
+    (process.env[name] || '')
+      .split(',')
+      .map((v) => v.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+/** Allowed Tailscale login names, e.g. "user@example.com". */
+const ALLOWED_USERS = envList('BRIDGE_ALLOWED_USERS');
+
+/** Allowed Tailscale ACL tags, e.g. "tag:ci". */
+const ALLOWED_TAGS = envList('BRIDGE_ALLOWED_TAGS');
+
+/** How long a whois verdict is reused, to avoid a subprocess per request. */
+const WHOIS_CACHE_MS = envInt('BRIDGE_WHOIS_CACHE_MS', 60_000);
+
+/** @type {Map<string, {expires: number, allowed: boolean, who: string}>} */
+const whoisCache = new Map();
+
+/**
+ * Normalise a socket peer address to a bare IP.
+ * Node reports IPv4 peers on a dual-stack socket as "::ffff:203.0.113.5".
+ * @param {string|undefined} address
+ * @returns {string|null} A valid IP, or null if it cannot be parsed as one
+ */
+function normalizePeerIp(address) {
+  if (typeof address !== 'string') return null;
+  let ip = address.trim().replace(/^\[|\]$/g, '');
+  if (/^::ffff:/i.test(ip) && isIP(ip.slice(7)) === 4) ip = ip.slice(7);
+  return isIP(ip) ? ip : null;
+}
+
+/**
+ * Run `tailscale whois --json <ip>` and extract the identity.
+ * The IP is passed as a separate argv entry and is validated as an IP by the
+ * caller, so there is no shell and nothing to interpolate into one.
+ * @param {string} ip A validated IP address
+ * @returns {Promise<{login: string|null, tags: string[]}>}
+ */
+function tailscaleWhois(ip) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      TAILSCALE_BIN,
+      ['whois', '--json', ip],
+      { timeout: 5_000, maxBuffer: 1024 * 1024, shell: false, windowsHide: true },
+      (err, stdout) => {
+        if (err) return reject(err);
+        let parsed;
+        try {
+          parsed = JSON.parse(stdout);
+        } catch {
+          return reject(new Error('tailscale whois returned unparseable JSON'));
+        }
+        // A tagged device has no user: UserProfile is absent or a placeholder,
+        // and the identity lives in Node.Tags instead.
+        const tags = Array.isArray(parsed?.Node?.Tags) ? parsed.Node.Tags : [];
+        const rawLogin = parsed?.UserProfile?.LoginName;
+        const login = typeof rawLogin === 'string' && rawLogin && !rawLogin.startsWith('tagged-devices')
+          ? rawLogin.toLowerCase()
+          : null;
+        resolve({ login, tags: tags.map((t) => String(t).toLowerCase()) });
+      },
+    );
+  });
+}
+
+/**
+ * Decide whether a peer may use the bridge, based on its Tailscale identity.
+ * Fails closed: any lookup error, unparseable address or unlisted identity is
+ * a denial. Loopback peers are exempt — they are already local to the machine
+ * running the bridge (and are how the EDA client itself connects), and
+ * `tailscale whois` cannot resolve them.
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {Promise<boolean>}
+ */
+async function peerIsAllowed(req) {
+  if (!TAILSCALE_WHOIS) return true;
+
+  const ip = normalizePeerIp(req.socket.remoteAddress);
+  if (!ip) {
+    console.warn('[whois] denied: peer address is not a valid IP');
+    return false;
+  }
+  if (ip === '127.0.0.1' || ip === '::1' || ip.startsWith('127.')) return true;
+
+  const cached = whoisCache.get(ip);
+  if (cached && cached.expires > Date.now()) return cached.allowed;
+
+  let allowed = false;
+  let who = 'unknown';
+  try {
+    const { login, tags } = await tailscaleWhois(ip);
+    who = login || tags.join(',') || 'unidentified';
+    allowed = (login !== null && ALLOWED_USERS.has(login)) || tags.some((t) => ALLOWED_TAGS.has(t));
+  } catch (err) {
+    console.warn(`[whois] denied ${ip}: lookup failed (${err.message})`);
+    allowed = false;
+  }
+
+  whoisCache.set(ip, { expires: Date.now() + WHOIS_CACHE_MS, allowed, who });
+  console.log(`[whois] ${allowed ? 'allowed' : 'denied'} ${ip} (${who})`);
+  return allowed;
 }
 
 function formatBannerLine(label, value) {
@@ -302,7 +425,13 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
-  // Every other route requires the bearer token when authentication is on.
+  // Every other route: identity allowlist first, then the bearer token.
+  if (!(await peerIsAllowed(req))) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Forbidden: peer identity is not allowed' }));
+    return;
+  }
+
   if (AUTH_REQUIRED && !tokenIsValid(bearerToken(req))) {
     console.warn(`[HTTP] 401 ${req.method} ${req.url} from ${req.socket.remoteAddress}`);
     res.writeHead(401, {
@@ -394,10 +523,13 @@ const wss = new WebSocketServer({
   server: httpServer,
   maxPayload: MAX_PAYLOAD_BYTES,
   verifyClient: ({ req }, done) => {
-    if (!AUTH_REQUIRED || req.url === '/eda') return done(true);
-    if (tokenIsValid(bearerToken(req))) return done(true);
-    console.warn(`[WS] Rejected unauthenticated agent connection from ${req.socket.remoteAddress}`);
-    done(false, 401, 'Unauthorized');
+    peerIsAllowed(req).then((allowed) => {
+      if (!allowed) return done(false, 403, 'Forbidden');
+      if (!AUTH_REQUIRED || req.url === '/eda') return done(true);
+      if (tokenIsValid(bearerToken(req))) return done(true);
+      console.warn(`[WS] Rejected unauthenticated agent connection from ${req.socket.remoteAddress}`);
+      done(false, 401, 'Unauthorized');
+    });
   },
 });
 
@@ -678,6 +810,7 @@ ${formatBannerLine('Port Range', FIXED_PORT !== null ? 'n/a (fixed port)' : `${P
 ${formatBannerLine('Timeout', `${REQUEST_TIMEOUT_MS} ms`)}
 ${formatBannerLine('Max Payload', `${MAX_PAYLOAD_BYTES / 1024 / 1024} MB`)}
 ${formatBannerLine('Auth', AUTH_REQUIRED ? 'bearer token required' : 'disabled (no token set)')}
+${formatBannerLine('Identity', TAILSCALE_WHOIS ? `tailscale whois (${ALLOWED_USERS.size} users, ${ALLOWED_TAGS.size} tags)` : 'disabled')}
 ${formatBannerLine('Service ID', SERVICE_ID)}
 ║                                                              ║
 ║  HTTP API:    http://localhost:${port}                         ║
@@ -695,6 +828,13 @@ ${formatBannerLine('Service ID', SERVICE_ID)}
 ╚══════════════════════════════════════════════════════════════╝
       `);
     });
+
+    if (TAILSCALE_WHOIS && ALLOWED_USERS.size === 0 && ALLOWED_TAGS.size === 0) {
+      console.warn(
+        '⚠️  BRIDGE_TAILSCALE_WHOIS is on but BRIDGE_ALLOWED_USERS and BRIDGE_ALLOWED_TAGS are\n' +
+        '    both empty. The allowlist fails closed, so every non-loopback peer is denied.',
+      );
+    }
 
     if (!isLoopbackHost(LISTEN_HOST) && !AUTH_REQUIRED) {
       console.warn(

@@ -74,6 +74,12 @@ is optional**, and the defaults reproduce the server's original behaviour, so
 | `BRIDGE_IPV6_LOOPBACK` | on for a loopback `BRIDGE_HOST`, off otherwise | Also listen on `[::1]` and forward to the main listener. **Symptom this fixes:** on Windows the EasyEDA client (Electron) resolves `localhost` to `::1` first; a server bound only to `127.0.0.1` is invisible to it and the extension reports *"Bridge not found"* even though `curl http://127.0.0.1:<port>/health` works. Set to `0` to disable, `1` to force it on. |
 | `BRIDGE_AUTH_TOKEN` | *(unset — no authentication)* | Shared secret required on every HTTP route except `GET /health`, and on every WebSocket connection. Leave unset for the usual local setup; **set it whenever the bridge is reachable from anything but the local machine.** See [Security](#security). |
 
+| `BRIDGE_TAILSCALE_WHOIS` | `off` | Resolve each peer's Tailscale identity and serve only allowlisted ones. See [Tailscale identity allowlist](#tailscale-identity-allowlist). |
+| `BRIDGE_ALLOWED_USERS` | *(empty)* | Comma-separated Tailscale logins allowed when the allowlist is on, e.g. `user@example.com,other@example.com`. |
+| `BRIDGE_ALLOWED_TAGS` | *(empty)* | Comma-separated Tailscale ACL tags allowed when the allowlist is on, e.g. `tag:ci,tag:workstation`. |
+| `BRIDGE_TAILSCALE_BIN` | `tailscale` | Path to the Tailscale CLI, if it is not on `PATH`. |
+| `BRIDGE_WHOIS_CACHE_MS` | `60000` | How long an identity verdict is cached per peer IP, so the CLI is not invoked on every request. |
+
 Booleans accept `1/0`, `true/false`, `yes/no`, `on/off`.
 
 Example — a long-running export session on a pinned port:
@@ -124,6 +130,45 @@ curl -H "Authorization: Bearer $MY_TOKEN" \
      -H "Content-Type: application/json" \
      -d '{"code": "return await eda.dmt_Project.getCurrentProjectInfo();"}'
 ```
+
+### Tailscale Identity Allowlist
+
+If the bridge runs on a host reachable over a [Tailscale](https://tailscale.com)
+network, it can additionally check *who* is connecting, not just that they hold
+the shared secret. Set `BRIDGE_TAILSCALE_WHOIS=1` and name the identities you
+accept:
+
+```bash
+BRIDGE_TAILSCALE_WHOIS=1 \
+BRIDGE_ALLOWED_USERS=user@example.com \
+BRIDGE_ALLOWED_TAGS=tag:ci \
+BRIDGE_AUTH_TOKEN=$MY_TOKEN \
+npm run server
+```
+
+How it works:
+
+- The peer IP of each incoming HTTP request and WebSocket upgrade is resolved
+  with `tailscale whois --json <ip>`, invoked directly (no shell) with the
+  address as a separate argument, after it has been validated as an IP.
+- A connection is served if the resolved login is in `BRIDGE_ALLOWED_USERS`, or
+  any of the node's ACL tags is in `BRIDGE_ALLOWED_TAGS`. Tagged devices report
+  no user at all, only tags, so a CI runner is matched by `tag:ci` alone.
+- **It fails closed.** An unresolvable address, a failed or timed-out lookup, a
+  missing CLI, or an identity that is not listed all result in `403`. If both
+  lists are empty every remote peer is denied, and the server says so at
+  startup.
+- Verdicts are cached per peer IP for `BRIDGE_WHOIS_CACHE_MS` (default 60s), so
+  a busy client does not spawn a subprocess per request. Removing someone from
+  the allowlist takes effect within that window.
+- **Loopback peers are exempt**, since `tailscale whois` cannot resolve them and
+  they are already local to the machine running the bridge — this is also how
+  the EDA client itself connects.
+- `GET /health` stays open, exactly as with token authentication, so port
+  discovery keeps working.
+
+This is a complement to `BRIDGE_AUTH_TOKEN`, not a replacement: a shared token
+proves possession of a secret, the allowlist proves identity. Use both.
 
 ## Security
 
