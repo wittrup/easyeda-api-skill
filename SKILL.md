@@ -101,6 +101,22 @@ fi
 echo "Bridge running on port: ${BRIDGE_PORT:-unknown}"
 ```
 
+#### Bridge configuration (optional)
+
+All of these are optional; unset means the default behaviour described above.
+
+| Variable | Default | Why |
+|----------|---------|-----|
+| `BRIDGE_HOST` | `127.0.0.1` | Bind interface. Leave on loopback unless deliberately exposing the bridge. |
+| `BRIDGE_PORT` | *(unset — scan `49620-49629`)* | Pin one port; fails loudly if taken instead of moving to another port. |
+| `BRIDGE_TIMEOUT_MS` | `30000` | Raise for slow operations (3D/STEP export, full manufacturing output of a large board). |
+| `BRIDGE_MAX_PAYLOAD_MB` | `100` | Raise when a single result is huge (base64 3D model / gerber archive) and the socket dies with `Max payload size exceeded`. |
+| `BRIDGE_IPV6_LOOPBACK` | on for loopback host | Also answer on `[::1]`. Fixes the Windows "Bridge not found" symptom: Electron resolves `localhost` to `::1` first, so an IPv4-only listener is invisible to the EDA client. |
+
+```bash
+BRIDGE_TIMEOUT_MS=600000 BRIDGE_MAX_PAYLOAD_MB=1024 node ${CLAUDE_SKILL_DIR}/scripts/bridge-server.mjs &
+```
+
 ### 4. Connect EasyEDA
 
 Install the `run-api-gateway.eext` extension in EasyEDA Pro. Download link:
@@ -675,7 +691,7 @@ If only one EDA window is connected, it's automatically selected as active.
 
 1. **Always check health first**: Scan ports 49620-49629 for `{"service":"easyeda-bridge"}`
 2. **EDA not connected?**: Ensure bridge extension is loaded in EasyEDA. Download: https://jlc-ext.com/item/oshwhub/run-api-gateway
-3. **Timeout errors**: Default 30s timeout. If timeout occurs:
+3. **Timeout errors**: Default 30s timeout (raise with `BRIDGE_TIMEOUT_MS`). If timeout occurs:
    - Check if the correct project and document are opened (use `dmt_Project.getCurrentProjectInfo()`)
    - If no project is opened, use `dmt_Project.openProject(projectPath)` to open one
    - If no document is active, use `dmt_EditorControl.openDocument(docId)` to open the correct document type (PCB/Schematic)

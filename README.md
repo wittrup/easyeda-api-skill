@@ -59,6 +59,28 @@ curl -X POST http://localhost:49620/execute \
   -d '{"code": "return await eda.dmt_Project.getCurrentProjectInfo();"}'
 ```
 
+## Bridge Server Configuration
+
+The bridge server is configured through environment variables. **Every variable
+is optional**, and the defaults reproduce the server's original behaviour, so
+`npm run server` with a clean environment works exactly as before.
+
+| Variable | Default | Why you would change it |
+|----------|---------|--------------------------|
+| `BRIDGE_HOST` | `127.0.0.1` | Interface to bind. Keep the loopback default unless you deliberately expose the bridge — it executes arbitrary JavaScript inside the EDA client, so anyone who can reach it controls the client. |
+| `BRIDGE_PORT` | *(unset — scan `49620-49629`)* | Pin a fixed port when something else must know the address up front (a reverse proxy, a firewall rule, a container port mapping). When set, the server binds **exactly** that port and exits with an error if it is taken, instead of silently moving to another port. |
+| `BRIDGE_TIMEOUT_MS` | `30000` | How long to wait for the EDA client to answer an `execute` request. Raise it for long-running operations — generating a 3D/STEP model or a full manufacturing export of a large board can take several minutes and will otherwise fail with a timeout. |
+| `BRIDGE_MAX_PAYLOAD_MB` | `100` | Maximum WebSocket frame size (100 MB is the `ws` library default). Raise it when a single result is large — a base64-encoded 3D model or gerber archive can exceed 100 MB, and the socket then dies with `Max payload size exceeded`. |
+| `BRIDGE_IPV6_LOOPBACK` | on for a loopback `BRIDGE_HOST`, off otherwise | Also listen on `[::1]` and forward to the main listener. **Symptom this fixes:** on Windows the EasyEDA client (Electron) resolves `localhost` to `::1` first; a server bound only to `127.0.0.1` is invisible to it and the extension reports *"Bridge not found"* even though `curl http://127.0.0.1:<port>/health` works. Set to `0` to disable, `1` to force it on. |
+
+Booleans accept `1/0`, `true/false`, `yes/no`, `on/off`.
+
+Example — a long-running export session on a pinned port:
+
+```bash
+BRIDGE_PORT=49620 BRIDGE_TIMEOUT_MS=600000 BRIDGE_MAX_PAYLOAD_MB=1024 npm run server
+```
+
 ## One-Command Packaging
 
 ```bash

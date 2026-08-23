@@ -33,13 +33,97 @@
 import { WebSocketServer } from 'ws';
 import { randomUUID } from 'node:crypto';
 import { createServer, get as httpGet } from 'node:http';
-import { createConnection } from 'node:net';
+import { createConnection, createServer as createTcpServer, connect as tcpConnect } from 'node:net';
 
 // ─── Port Configuration ─────────────────────────────────────────────
 const PORT_START = 49620;
 const PORT_END = 49629;
 const SERVICE_ID = 'easyeda-bridge';
-const LISTEN_HOST = '127.0.0.1';
+
+// ─── Environment configuration ──────────────────────────────────────
+// Every option below defaults to the historical behaviour, so running the
+// server with no environment variables set behaves exactly as before.
+// See the "Bridge server configuration" section of the README.
+
+/**
+ * Read a positive integer from the environment.
+ * @param {string} name Environment variable name
+ * @param {number|null} fallback Value used when unset/blank
+ * @returns {number|null}
+ */
+function envInt(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    console.error(`❌ ${name} must be a positive number (got "${raw}")`);
+    process.exit(1);
+  }
+  return value;
+}
+
+/**
+ * Read a boolean from the environment ("1"/"true"/"yes"/"on" and negations).
+ * @param {string} name Environment variable name
+ * @param {boolean} fallback Value used when unset/blank
+ * @returns {boolean}
+ */
+function envBool(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = raw.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(value)) return true;
+  if (['0', 'false', 'no', 'off'].includes(value)) return false;
+  console.error(`❌ ${name} must be a boolean (got "${raw}")`);
+  process.exit(1);
+}
+
+/**
+ * Whether a host string refers to the local machine only.
+ * @param {string} host
+ * @returns {boolean}
+ */
+function isLoopbackHost(host) {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return h === 'localhost' || h === '::1' || /^127\./.test(h);
+}
+
+/** Interface the HTTP server binds to. */
+const LISTEN_HOST = process.env.BRIDGE_HOST?.trim() || '127.0.0.1';
+
+/** Fixed port, or null to scan PORT_START..PORT_END for a free one. */
+const FIXED_PORT = envInt('BRIDGE_PORT', null);
+
+/**
+ * Host used for outgoing probes (singleton detection, port-in-use checks).
+ * A wildcard bind address cannot be connected to, so probe loopback instead.
+ */
+const PROBE_HOST = (LISTEN_HOST === '0.0.0.0' || LISTEN_HOST === '::' || LISTEN_HOST === '[::]')
+  ? '127.0.0.1'
+  : LISTEN_HOST;
+
+/**
+ * How long to wait for the EDA client to answer an execute request.
+ * Manufacturing exports (e.g. generating a STEP model of a large board) can
+ * take several minutes — raise this when driving such operations.
+ */
+const REQUEST_TIMEOUT_MS = envInt('BRIDGE_TIMEOUT_MS', 30_000);
+
+/**
+ * Maximum WebSocket frame size. 100 MiB matches the `ws` default; large
+ * base64-encoded exports (3D models, full gerber sets) can exceed it and kill
+ * the socket with "Max payload size exceeded".
+ */
+const MAX_PAYLOAD_BYTES = envInt('BRIDGE_MAX_PAYLOAD_MB', 100) * 1024 * 1024;
+
+/**
+ * Additionally listen on the IPv6 loopback and forward to the main listener.
+ * EasyEDA runs on Electron, which on Windows resolves "localhost" to `::1`
+ * first; a server bound only to 127.0.0.1 is then invisible to it and the
+ * extension reports "Bridge not found". Only meaningful for loopback binds,
+ * so it is enabled by default there and off for a non-loopback host.
+ */
+const IPV6_LOOPBACK = envBool('BRIDGE_IPV6_LOOPBACK', isLoopbackHost(LISTEN_HOST));
 
 function formatBannerLine(label, value) {
   return `║  ${`${label}:`.padEnd(12)} ${String(value).padEnd(44)}║`;
@@ -55,8 +139,6 @@ const pendingRequests = new Map();
 /** @type {string | null} 当前AI端选中的EDA窗口ID */
 let activeEdaWindowId = null;
 
-const REQUEST_TIMEOUT_MS = 30_000;
-
 // ─── Port Detection ─────────────────────────────────────────────────
 
 /**
@@ -66,7 +148,7 @@ const REQUEST_TIMEOUT_MS = 30_000;
  */
 function isPortInUse(port) {
   return new Promise((resolve) => {
-    const socket = createConnection({ port, host: '127.0.0.1' });
+    const socket = createConnection({ port, host: PROBE_HOST });
     socket.setTimeout(300);
     socket.on('connect', () => {
       socket.destroy();
@@ -91,7 +173,8 @@ function isPortInUse(port) {
  */
 function isBridgeRunning(port) {
   return new Promise((resolve) => {
-    const req = httpGet(`http://127.0.0.1:${port}/health`, { timeout: 800 }, (res) => {
+    const host = PROBE_HOST.includes(':') && !PROBE_HOST.startsWith('[') ? `[${PROBE_HOST}]` : PROBE_HOST;
+    const req = httpGet(`http://${host}:${port}/health`, { timeout: 800 }, (res) => {
       let data = '';
       res.on('data', (chunk) => (data += chunk));
       res.on('end', () => {
@@ -109,10 +192,14 @@ function isBridgeRunning(port) {
 }
 
 /**
- * Detect if an existing bridge instance is already running in the port range.
+ * Detect if an existing bridge instance is already running.
+ * With BRIDGE_PORT set only that port is checked, otherwise the whole range.
  * @returns {Promise<number|null>} The port of the existing instance, or null
  */
 async function findExistingInstance() {
+  if (FIXED_PORT !== null) {
+    return (await isBridgeRunning(FIXED_PORT)) ? FIXED_PORT : null;
+  }
   for (let port = PORT_START; port <= PORT_END; port++) {
     if (await isBridgeRunning(port)) return port;
   }
@@ -120,10 +207,17 @@ async function findExistingInstance() {
 }
 
 /**
- * Find the first available port in range.
+ * Pick the port to listen on: the one pinned by BRIDGE_PORT, or the first
+ * free port in the default range.
  * @returns {Promise<number>}
  */
 async function findAvailablePort() {
+  if (FIXED_PORT !== null) {
+    if (await isPortInUse(FIXED_PORT)) {
+      throw new Error(`BRIDGE_PORT=${FIXED_PORT} is already in use by another process`);
+    }
+    return FIXED_PORT;
+  }
   for (let port = PORT_START; port <= PORT_END; port++) {
     const inUse = await isPortInUse(port);
     if (!inUse) return port;
@@ -232,7 +326,7 @@ const httpServer = createServer(async (req, res) => {
 });
 
 // ─── WebSocket Server ───────────────────────────────────────────────
-const wss = new WebSocketServer({ server: httpServer });
+const wss = new WebSocketServer({ server: httpServer, maxPayload: MAX_PAYLOAD_BYTES });
 
 wss.on('connection', (ws, req) => {
   const clientType = req.url === '/eda' ? 'eda' : 'agent';
@@ -443,6 +537,36 @@ function handleEdaMessage(msg, windowId) {
 }
 
 // ─── Start ──────────────────────────────────────────────────────────
+
+/**
+ * Optionally also accept connections on the IPv6 loopback and forward them to
+ * the main listener.
+ *
+ * Why: EasyEDA is an Electron app, and on Windows Electron resolves
+ * "localhost" to `::1` before trying `127.0.0.1`. A server bound only to the
+ * IPv4 loopback is invisible to it and the extension reports "Bridge not
+ * found". Forwarding keeps the service loopback-only while answering on both
+ * families. Controlled by BRIDGE_IPV6_LOOPBACK.
+ *
+ * @param {number} port Port the main listener is bound to
+ */
+function startIpv6LoopbackForwarder(port) {
+  if (!IPV6_LOOPBACK) return;
+  // Nothing to forward if the main listener already answers on IPv6.
+  const bound = LISTEN_HOST.replace(/^\[|\]$/g, '');
+  if (bound === '::1' || bound === '::') return;
+
+  const forwarder = createTcpServer((sock) => {
+    const upstream = tcpConnect(port, PROBE_HOST);
+    sock.pipe(upstream);
+    upstream.pipe(sock);
+    sock.on('error', () => upstream.destroy());
+    upstream.on('error', () => sock.destroy());
+  });
+  forwarder.on('error', (err) => console.log('[ipv6] loopback forwarder disabled:', err.code));
+  forwarder.listen(port, '::1', () => console.log(`[ipv6] also listening on [::1]:${port}`));
+}
+
 async function start() {
   try {
     // ── Singleton check: exit if an identical bridge is already running ──
@@ -460,9 +584,11 @@ async function start() {
 ║         EasyEDA WebSocket Bridge Server                      ║
 ╠══════════════════════════════════════════════════════════════╣
 ║                                                              ║
-${formatBannerLine('Port', port)}
-${formatBannerLine('Listen Host', `${LISTEN_HOST} (localhost only)`)}
-${formatBannerLine('Port Range', `${PORT_START}-${PORT_END}`)}
+${formatBannerLine('Port', FIXED_PORT !== null ? `${port} (pinned by BRIDGE_PORT)` : port)}
+${formatBannerLine('Listen Host', `${LISTEN_HOST}${isLoopbackHost(LISTEN_HOST) ? ' (localhost only)' : ''}`)}
+${formatBannerLine('Port Range', FIXED_PORT !== null ? 'n/a (fixed port)' : `${PORT_START}-${PORT_END}`)}
+${formatBannerLine('Timeout', `${REQUEST_TIMEOUT_MS} ms`)}
+${formatBannerLine('Max Payload', `${MAX_PAYLOAD_BYTES / 1024 / 1024} MB`)}
 ${formatBannerLine('Service ID', SERVICE_ID)}
 ║                                                              ║
 ║  HTTP API:    http://localhost:${port}                         ║
@@ -481,8 +607,14 @@ ${formatBannerLine('Service ID', SERVICE_ID)}
       `);
     });
 
+    startIpv6LoopbackForwarder(port);
+
     httpServer.on('error', (err) => {
       if (err.code === 'EADDRINUSE') {
+        if (FIXED_PORT !== null) {
+          console.error(`❌ Port ${port} (BRIDGE_PORT) is occupied — refusing to fall back to another port.`);
+          process.exit(1);
+        }
         console.error(`❌ Port ${port} became occupied. Restarting...`);
         httpServer.close();
         start(); // Retry
